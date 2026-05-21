@@ -1,0 +1,4 @@
+codrone-edu>=2.0
+mediapipe>=0.10.9
+opencv-python>=4.8
+numpy>=1.24
