@@ -1,86 +1,104 @@
-"""Map recognized hand state to drone Commands.
+"""Two-handed RC-stick gesture mapper.
 
-Uses the pretrained gesture label (Open_Palm / Closed_Fist / Thumb_Up /
-Pointing_Up / Victory / ILoveYou / Thumb_Down / None) for high-level actions,
-and uses palm-center + palm-tilt geometry for continuous flight in "Pointing_Up"
-mode.
+Design:
+    The user's two hands act like the two sticks on a standard "Mode 2"
+    drone RC transmitter:
 
-Pure: no MediaPipe / camera / drone imports. Easy to unit test.
+        LEFT hand (left half of frame)  →  Up/Down  (Y)  +  Turn  (X)
+        RIGHT hand (right half of frame)→  Fwd/Back (Y)  +  Left/Right (X)
+
+    Each stick reads only the 2-D image position of the hand inside its own
+    "stick box" (a neutral point with a fixed range around it). Because each
+    hand drives only its own axes, moving one hand can never accidentally
+    change the other axes — the system is fully decoupled.
+
+    Action gestures:
+        BOTH hands open palm  → takeoff
+        BOTH hands closed fist→ land
+        EITHER thumb down     → emergency stop (single-hand for emergencies)
+
+    Anything else with two hands visible = continuous flight.
+    Anything with fewer than two hands and no action gesture = hover.
+
+Pure logic — no MediaPipe / drone imports — so it's easy to unit test.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 
 from .smoothing import OneEuroFilter
 
-# Actions
+
+# --- Actions -----------------------------------------------------------------
+
 ACTION_NONE = "none"
 ACTION_TAKEOFF = "takeoff"
 ACTION_LAND = "land"
 ACTION_ESTOP = "estop"
 ACTION_FLY = "fly"
-ACTION_FLIP = "flip"  # reserved; not auto-fired
+
+
+# --- Public types ------------------------------------------------------------
+
+@dataclass
+class HandObservation:
+    """One detected hand in a frame."""
+    landmarks: np.ndarray  # (21, 3), normalized
+    gesture: str = ""
+    score: float = 0.0
 
 
 @dataclass
 class Command:
     action: str = ACTION_NONE
-    pitch: float = 0.0
-    roll: float = 0.0
-    throttle: float = 0.0
-    yaw: float = 0.0
+    pitch: float = 0.0    # forward (+) / back (-)
+    roll: float = 0.0     # right (+) / left (-)
+    throttle: float = 0.0 # up (+) / down (-)
+    yaw: float = 0.0      # turn right (+) / left (-)
 
 
 @dataclass
 class MapperConfig:
-    deadzone: float = 0.10          # fraction of frame around center → 0 output
-    max_speed: int = 50             # codrone_edu speed range is [-100, 100]
-    expo: float = 0.35              # 0 = linear, higher = softer near center
-    hold_frames: int = 10           # ~0.33 s @ 30 fps for one-shot gestures
-    fly_hold_frames: int = 3        # smaller hold to enter continuous mode
-    estop_hold_frames: int = 18     # E-stop deliberately requires a longer hold
-    min_gesture_score: float = 0.55 # ignore low-confidence gesture predictions
-    yaw_gain: float = 1.4           # how aggressively hand roll maps to yaw
-    # Forward/back pitch: derived from apparent hand size. The baseline is the
-    # palm length (wrist → middle-finger MCP) in normalized image coords at the
-    # user's "neutral" distance from the camera. Bigger than baseline ⇒ closer
-    # to camera ⇒ forward. Smaller ⇒ farther ⇒ backward.
-    pitch_baseline: float = 0.18
-    pitch_gain: float = 6.0
-    pitch_deadband: float = 0.15    # ignore deviations smaller than this (fraction)
+    max_speed: int = 50
+    expo: float = 0.4
+    deadzone: float = 0.18         # fraction of stick_range — small wobbles → 0
+    hold_frames: int = 10          # ~0.33 s @ 30 fps for takeoff/land
+    estop_hold_frames: int = 12    # E-stop needs a deliberate hold too
+    min_gesture_score: float = 0.55
+
+    # Stick layout in frame-normalized coords. Default: left stick centered in
+    # the left half, right stick centered in the right half.
+    left_neutral_x: float = 0.25
+    left_neutral_y: float = 0.50
+    right_neutral_x: float = 0.75
+    right_neutral_y: float = 0.50
+    stick_range: float = 0.20      # half-range of each axis (fraction of frame)
 
 
-# Gesture name → high-level action. "Pointing_Up" stays as continuous control,
-# handled separately.
-_ONE_SHOT_ACTIONS = {
-    "Open_Palm": ACTION_TAKEOFF,
-    "Closed_Fist": ACTION_LAND,
-    "Thumb_Down": ACTION_ESTOP,
-}
-
-
-def _expo(v: float, k: float) -> float:
-    """Symmetric expo curve: soft near zero, full near ±1."""
-    sign = 1.0 if v >= 0 else -1.0
-    m = min(abs(v), 1.0)
-    return sign * ((1 - k) * m + k * m * m * m)
-
+# --- Internals ---------------------------------------------------------------
 
 def _clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
 
+def _expo(v: float, k: float) -> float:
+    sign = 1.0 if v >= 0 else -1.0
+    m = min(abs(v), 1.0)
+    return sign * ((1 - k) * m + k * m * m * m)
+
+
+# --- Mapper ------------------------------------------------------------------
+
 @dataclass
 class GestureMapper:
     config: MapperConfig = field(default_factory=MapperConfig)
 
-    # Debounce state
-    _last_gesture: str = ""
-    _streak: int = 0
+    # Action debounce state
+    _last_action: str = ""
+    _action_streak: int = 0
     _fired: set = field(default_factory=set)
 
     # Output smoothers
@@ -90,114 +108,121 @@ class GestureMapper:
     _yaw_f: OneEuroFilter = field(default_factory=lambda: OneEuroFilter(min_cutoff=1.0, beta=0.03))
 
     def reset(self) -> None:
-        self._last_gesture = ""
-        self._streak = 0
+        self._last_action = ""
+        self._action_streak = 0
         self._fired.clear()
         for f in (self._pitch_f, self._roll_f, self._throttle_f, self._yaw_f):
             f.reset()
 
-    # --- main entry ------------------------------------------------------------
-
+    # -- main entry --
     def update(
         self,
-        landmarks: Optional[np.ndarray],
-        gesture: str = "",
-        score: float = 0.0,
+        hands: List[HandObservation],
         timestamp: Optional[float] = None,
     ) -> Command:
-        # No hand → reset state, hand off to controller (it auto-lands).
-        if landmarks is None:
-            self._last_gesture = ""
-            self._streak = 0
-            self._fired.clear()
+        if not hands:
+            self._reset_action_streak()
             return Command(action=ACTION_NONE)
 
-        cfg = self.config
+        # Sort by wrist X so index 0 is the user's LEFT-side hand on screen
+        # (we already mirror the frame in main, so this matches the user's POV).
+        ordered = sorted(hands, key=lambda h: float(h.landmarks[0, 0]))
 
-        # Treat low-confidence predictions as "no gesture" (still in flight mode if eligible).
-        effective = gesture if score >= cfg.min_gesture_score else ""
+        fired, pending = self._detect_action(ordered)
+        if fired:
+            return Command(action=fired)
 
-        # Track streak for debouncing.
-        if effective == self._last_gesture:
-            self._streak += 1
-        else:
-            self._last_gesture = effective
-            self._streak = 1
-            self._fired.clear()
-
-        # One-shot actions: open palm / fist / thumb-down → fire once after hold.
-        if effective in _ONE_SHOT_ACTIONS:
-            hold = cfg.estop_hold_frames if effective == "Thumb_Down" else cfg.hold_frames
-            action = _ONE_SHOT_ACTIONS[effective]
-            if self._streak >= hold and action not in self._fired:
-                self._fired.add(action)
-                return Command(action=action)
+        # User is holding an action gesture but the hold hasn't fired yet —
+        # don't fly through it. Just hover.
+        if pending:
             return Command(action=ACTION_NONE)
 
-        # Continuous control: hand visible (any non-action gesture) → fly.
-        if self._streak >= cfg.fly_hold_frames:
-            return self._fly_command(landmarks, timestamp)
+        if len(ordered) >= 2:
+            return self._fly(left=ordered[0], right=ordered[-1], t=timestamp)
 
+        # Single hand visible without an action gesture → hover (no input).
         return Command(action=ACTION_NONE)
 
-    # --- continuous control ----------------------------------------------------
-
-    def _fly_command(self, lm: np.ndarray, t: Optional[float]) -> Command:
+    # -- action detection --
+    # Returns (fired_action, pending_action_bool). `fired` is non-empty only on
+    # the frame the hold completes. `pending` is True while the user is holding
+    # a recognized action gesture but the hold hasn't elapsed yet — caller
+    # should hover, not fly, during that window.
+    def _detect_action(self, hands: List[HandObservation]):
         cfg = self.config
 
-        # Palm center = mean of wrist (0) and MCPs of index/middle/ring/pinky (5,9,13,17).
-        palm = lm[[0, 5, 9, 13, 17]].mean(axis=0)
-        # Offsets from frame center, in roughly [-1, 1].
-        dx = (palm[0] - 0.5) * 2.0
-        dy = (palm[1] - 0.5) * 2.0
+        # Any confident thumb-down → E-stop
+        for h in hands:
+            if h.gesture == "Thumb_Down" and h.score >= cfg.min_gesture_score:
+                return self._track_action(ACTION_ESTOP, cfg.estop_hold_frames), True
 
-        # Hand roll = angle of the line from pinky-MCP (17) to index-MCP (5).
-        # When palm is held flat-vertical the line is roughly horizontal; tilting
-        # the hand left or right rotates it. This drives yaw.
-        v = lm[5] - lm[17]
-        roll_angle = math.atan2(v[1], v[0])  # radians; 0 ≈ flat (index right of pinky)
-        # Normalize so flat hand ~ 0.
-        norm_yaw = _clamp(roll_angle / (math.pi / 2), -1.0, 1.0) * cfg.yaw_gain
-        norm_yaw = _clamp(norm_yaw, -1.0, 1.0)
+        # Takeoff / land require BOTH hands to agree
+        if len(hands) >= 2 and all(h.score >= cfg.min_gesture_score for h in hands[:2]):
+            gestures = {hands[0].gesture, hands[1].gesture}
+            if gestures == {"Open_Palm"}:
+                return self._track_action(ACTION_TAKEOFF, cfg.hold_frames), True
+            if gestures == {"Closed_Fist"}:
+                return self._track_action(ACTION_LAND, cfg.hold_frames), True
 
-        # Forward/back pitch from apparent palm size in the image.
-        # Wrist-z in MediaPipe is unreliable on its own; the projected palm
-        # length is much more stable. Bigger than baseline → closer → forward.
-        palm_len = float(np.linalg.norm(lm[9, :2] - lm[0, :2]))
-        pitch_raw = (palm_len - cfg.pitch_baseline) / cfg.pitch_baseline
-        if abs(pitch_raw) < cfg.pitch_deadband:
-            pitch_signal = 0.0
+        self._reset_action_streak()
+        return "", False
+
+    def _track_action(self, action: str, hold: int) -> str:
+        if action == self._last_action:
+            self._action_streak += 1
         else:
-            sign = 1.0 if pitch_raw > 0 else -1.0
-            pitch_signal = _clamp(
-                sign * (abs(pitch_raw) - cfg.pitch_deadband) * cfg.pitch_gain,
-                -1.0, 1.0,
-            )
+            self._last_action = action
+            self._action_streak = 1
+            self._fired.clear()
+        if self._action_streak >= hold and action not in self._fired:
+            self._fired.add(action)
+            return action
+        return ""
 
-        roll_norm = self._shape(dx)
-        throttle_norm = self._shape(-dy)  # invert: hand up (small y) → throttle up
-        # pitch_signal is already deadbanded above, so use zero deadzone here.
-        pitch_norm = self._shape(pitch_signal, deadzone=0.0)
+    def _reset_action_streak(self) -> None:
+        self._last_action = ""
+        self._action_streak = 0
+        self._fired.clear()
 
-        roll_out = self._roll_f(roll_norm * cfg.max_speed, t)
-        throttle_out = self._throttle_f(throttle_norm * cfg.max_speed, t)
-        pitch_out = self._pitch_f(pitch_norm * cfg.max_speed, t)
-        yaw_out = self._yaw_f(self._shape(norm_yaw, deadzone=cfg.deadzone) * cfg.max_speed, t)
+    # -- fly mode --
+    def _fly(
+        self,
+        left: HandObservation,
+        right: HandObservation,
+        t: Optional[float],
+    ) -> Command:
+        cfg = self.config
+
+        # Use the palm center (mean of wrist + 4 MCPs) as the reference point —
+        # it's much more stable than the wrist on its own.
+        l_palm = left.landmarks[[0, 5, 9, 13, 17]].mean(axis=0)
+        r_palm = right.landmarks[[0, 5, 9, 13, 17]].mean(axis=0)
+
+        # Left stick: throttle (Y) + yaw (X)
+        left_dx = (float(l_palm[0]) - cfg.left_neutral_x) / cfg.stick_range
+        left_dy = (float(l_palm[1]) - cfg.left_neutral_y) / cfg.stick_range
+        throttle_n = self._shape(-left_dy)  # hand up (smaller y) → throttle up
+        yaw_n = self._shape(left_dx)        # hand right → turn right
+
+        # Right stick: pitch (Y) + roll (X)
+        right_dx = (float(r_palm[0]) - cfg.right_neutral_x) / cfg.stick_range
+        right_dy = (float(r_palm[1]) - cfg.right_neutral_y) / cfg.stick_range
+        pitch_n = self._shape(-right_dy)    # hand up → forward
+        roll_n = self._shape(right_dx)      # hand right → fly right
 
         return Command(
             action=ACTION_FLY,
-            pitch=pitch_out,
-            roll=roll_out,
-            throttle=throttle_out,
-            yaw=yaw_out,
+            pitch=self._pitch_f(pitch_n * cfg.max_speed, t),
+            roll=self._roll_f(roll_n * cfg.max_speed, t),
+            throttle=self._throttle_f(throttle_n * cfg.max_speed, t),
+            yaw=self._yaw_f(yaw_n * cfg.max_speed, t),
         )
 
-    def _shape(self, v: float, deadzone: Optional[float] = None) -> float:
+    def _shape(self, v: float) -> float:
         cfg = self.config
-        dz = cfg.deadzone if deadzone is None else deadzone
-        if abs(v) < dz:
+        v = _clamp(v, -1.0, 1.0)
+        if abs(v) < cfg.deadzone:
             return 0.0
         sign = 1.0 if v > 0 else -1.0
-        # Rescale (dz, 1) → (0, 1) then apply expo.
-        rescaled = (abs(v) - dz) / (1.0 - dz)
+        rescaled = (abs(v) - cfg.deadzone) / (1.0 - cfg.deadzone)
         return sign * _expo(_clamp(rescaled, 0.0, 1.0), cfg.expo)

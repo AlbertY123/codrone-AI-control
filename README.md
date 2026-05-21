@@ -75,38 +75,55 @@ With drone:
 python -m src.main
 ```
 
-## Gestures
+## How control works — two hands, like a real RC transmitter
+
+The screen is split into a **left zone** and a **right zone**, each drawn as
+a box with a "+" in the middle. Put one hand in each zone. Each hand acts
+like the corresponding stick on a Mode-2 drone remote — independently.
+
+```
+  ┌─────────── LEFT HAND ───────────┐   ┌─────────── RIGHT HAND ──────────┐
+  │            Up / Down            │   │           Fwd / Back            │
+  │                                 │   │                                 │
+  │   Turn Left ←───+───→ Turn Right│   │   Strafe Left ←─+─→ Strafe Right│
+  │                                 │   │                                 │
+  │            Up / Down            │   │           Fwd / Back            │
+  └─────────────────────────────────┘   └─────────────────────────────────┘
+```
+
+| If you move…                  | Drone reacts by…   |
+|-------------------------------|--------------------|
+| Left hand up                  | Going up           |
+| Left hand down                | Going down         |
+| Left hand right               | Turning right      |
+| Left hand left                | Turning left       |
+| Right hand up                 | Flying forward     |
+| Right hand down               | Flying backward    |
+| Right hand right              | Sliding right      |
+| Right hand left               | Sliding left       |
+
+Because each hand only drives its own two axes, moving one hand **cannot
+accidentally affect the other axes**. No more "I tried to go left and it
+also drifted forward".
+
+Each box has a small dead-zone around its "+", and outputs are smoothed by a
+One-Euro filter so the drone hovers cleanly when your hands are near center.
+
+### Takeoff, land, and emergency stop
+
+| Hand shapes                  | What happens         |
+|------------------------------|----------------------|
+| **Both** open palms          | Takeoff              |
+| **Both** closed fists        | Land                 |
+| **Either** thumb pointing down | Emergency stop     |
+
+Hold the shape for about a third of a second to confirm — this prevents
+accidental triggers while you're moving your hand around. Press **q** at any
+time to land and quit.
 
 Hand detection and gesture classification use Google's pretrained
 **MediaPipe GestureRecognizer** model (auto-downloaded on first run to
-`models/gesture_recognizer.task`). Recognized hand shapes do these things:
-
-| Hand shape           | What the drone does                   |
-|----------------------|---------------------------------------|
-| Open palm            | Takes off (hold for ~0.3 s)           |
-| Closed fist          | Lands                                 |
-| Thumb down           | Emergency stop (hold longer)          |
-| Index finger up      | Enters fly mode — see below           |
-| (anything else)      | Hovers in place                       |
-
-### Fly mode — how your hand moves the drone
-
-Once you raise your index finger and the drone enters fly mode, move your hand
-around in front of the camera:
-
-| Hand motion                                  | Drone reaction          |
-|----------------------------------------------|-------------------------|
-| Move hand **left / right**                   | Drone slides left/right |
-| Move hand **up / down**                      | Drone rises / lowers    |
-| Move hand **closer to / farther from camera**| Drone flies forward / back |
-| **Tilt hand** clockwise / counter-clockwise  | Drone turns right / left|
-
-When your hand is near the middle of the frame at a normal distance, all four
-controls sit at zero and the drone hovers. There's a small dead-zone around
-the center so tiny hand wobbles don't move the drone, and outputs are smoothed
-by a One-Euro filter so motion stays clean.
-
-Press **q** at any time to land and quit.
+`models/gesture_recognizer.task`).
 
 ### Under the hood
 
