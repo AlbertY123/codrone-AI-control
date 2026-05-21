@@ -1,23 +1,21 @@
-"""Map hand landmarks to drone Commands.
+"""Map recognized hand state to drone Commands.
 
-Pure functions + a small debounce state machine. No drone, no camera, no
-MediaPipe imports — easy to unit test.
+Uses the pretrained gesture label (Open_Palm / Closed_Fist / Thumb_Up /
+Pointing_Up / Victory / ILoveYou / Thumb_Down / None) for high-level actions,
+and uses palm-center + palm-tilt geometry for continuous flight in "Pointing_Up"
+mode.
 
-MediaPipe landmark indices used here:
-    0  wrist
-    4  thumb tip          (3 thumb IP, 2 thumb MCP)
-    8  index tip          (6 index PIP)
-    12 middle tip         (10 middle PIP)
-    16 ring tip           (14 ring PIP)
-    20 pinky tip          (18 pinky PIP)
+Pure: no MediaPipe / camera / drone imports. Easy to unit test.
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Optional
 
 import numpy as np
 
+from .smoothing import OneEuroFilter
 
 # Actions
 ACTION_NONE = "none"
@@ -25,6 +23,7 @@ ACTION_TAKEOFF = "takeoff"
 ACTION_LAND = "land"
 ACTION_ESTOP = "estop"
 ACTION_FLY = "fly"
+ACTION_FLIP = "flip"  # reserved; not auto-fired
 
 
 @dataclass
@@ -36,36 +35,32 @@ class Command:
     yaw: float = 0.0
 
 
-def fingers_up(landmarks: np.ndarray) -> List[bool]:
-    """Return [thumb, index, middle, ring, pinky] up/down booleans.
-
-    Thumb compares x (it sticks out sideways); others compare y (tip above PIP
-    in image coords means smaller y).
-    """
-    lm = landmarks
-    # Thumb: tip vs IP joint on x. Direction depends on which hand; we use
-    # absolute distance + a sign relative to wrist for robustness.
-    thumb_up = abs(lm[4, 0] - lm[2, 0]) > 0.04 and lm[4, 1] < lm[2, 1] + 0.02
-    index_up = lm[8, 1] < lm[6, 1] - 0.02
-    middle_up = lm[12, 1] < lm[10, 1] - 0.02
-    ring_up = lm[16, 1] < lm[14, 1] - 0.02
-    pinky_up = lm[20, 1] < lm[18, 1] - 0.02
-    return [thumb_up, index_up, middle_up, ring_up, pinky_up]
+@dataclass
+class MapperConfig:
+    deadzone: float = 0.10          # fraction of frame around center → 0 output
+    max_speed: int = 50             # codrone_edu speed range is [-100, 100]
+    expo: float = 0.35              # 0 = linear, higher = softer near center
+    hold_frames: int = 10           # ~0.33 s @ 30 fps for one-shot gestures
+    fly_hold_frames: int = 3        # smaller hold to enter continuous mode
+    estop_hold_frames: int = 18     # E-stop deliberately requires a longer hold
+    min_gesture_score: float = 0.55 # ignore low-confidence gesture predictions
+    yaw_gain: float = 1.4           # how aggressively hand roll maps to yaw
 
 
-def classify_static_gesture(landmarks: np.ndarray) -> str:
-    """Return one of: 'open_palm', 'fist', 'thumbs_up', 'index_only', 'other'."""
-    f = fingers_up(landmarks)
-    thumb, index, middle, ring, pinky = f
-    if all([thumb, index, middle, ring, pinky]):
-        return "open_palm"
-    if not any([index, middle, ring, pinky]) and not thumb:
-        return "fist"
-    if thumb and not any([index, middle, ring, pinky]):
-        return "thumbs_up"
-    if index and not any([middle, ring, pinky]):
-        return "index_only"
-    return "other"
+# Gesture name → high-level action. "Pointing_Up" stays as continuous control,
+# handled separately.
+_ONE_SHOT_ACTIONS = {
+    "Open_Palm": ACTION_TAKEOFF,
+    "Closed_Fist": ACTION_LAND,
+    "Thumb_Down": ACTION_ESTOP,
+}
+
+
+def _expo(v: float, k: float) -> float:
+    """Symmetric expo curve: soft near zero, full near ±1."""
+    sign = 1.0 if v >= 0 else -1.0
+    m = min(abs(v), 1.0)
+    return sign * ((1 - k) * m + k * m * m * m)
 
 
 def _clamp(v: float, lo: float, hi: float) -> float:
@@ -73,98 +68,118 @@ def _clamp(v: float, lo: float, hi: float) -> float:
 
 
 @dataclass
-class MapperConfig:
-    deadzone: float = 0.12       # fraction of frame around center that maps to 0
-    max_speed: int = 50          # codrone speeds are in [-100, 100]
-    hold_frames: int = 12        # ~0.4s at 30fps to trigger one-shot gestures
-    fly_hold_frames: int = 3     # smoother enter into continuous flight
-
-
-@dataclass
 class GestureMapper:
     config: MapperConfig = field(default_factory=MapperConfig)
 
-    # Internal debounce state
-    _last_gesture: str = "other"
-    _gesture_streak: int = 0
-    _armed_actions: set = field(default_factory=set)  # actions already fired this hold
+    # Debounce state
+    _last_gesture: str = ""
+    _streak: int = 0
+    _fired: set = field(default_factory=set)
+
+    # Output smoothers
+    _pitch_f: OneEuroFilter = field(default_factory=lambda: OneEuroFilter(min_cutoff=1.2, beta=0.04))
+    _roll_f: OneEuroFilter = field(default_factory=lambda: OneEuroFilter(min_cutoff=1.2, beta=0.04))
+    _throttle_f: OneEuroFilter = field(default_factory=lambda: OneEuroFilter(min_cutoff=1.2, beta=0.04))
+    _yaw_f: OneEuroFilter = field(default_factory=lambda: OneEuroFilter(min_cutoff=1.0, beta=0.03))
 
     def reset(self) -> None:
-        self._last_gesture = "other"
-        self._gesture_streak = 0
-        self._armed_actions.clear()
+        self._last_gesture = ""
+        self._streak = 0
+        self._fired.clear()
+        for f in (self._pitch_f, self._roll_f, self._throttle_f, self._yaw_f):
+            f.reset()
 
-    def update(self, landmarks: Optional[np.ndarray]) -> Command:
+    # --- main entry ------------------------------------------------------------
+
+    def update(
+        self,
+        landmarks: Optional[np.ndarray],
+        gesture: str = "",
+        score: float = 0.0,
+        timestamp: Optional[float] = None,
+    ) -> Command:
+        # No hand → reset state, hand off to controller (it auto-lands).
         if landmarks is None:
-            # No hand: caller decides what to do (auto-land timer lives in controller).
-            self._last_gesture = "other"
-            self._gesture_streak = 0
+            self._last_gesture = ""
+            self._streak = 0
+            self._fired.clear()
             return Command(action=ACTION_NONE)
-
-        gesture = classify_static_gesture(landmarks)
-        if gesture == self._last_gesture:
-            self._gesture_streak += 1
-        else:
-            self._last_gesture = gesture
-            self._gesture_streak = 1
-            self._armed_actions.clear()
 
         cfg = self.config
 
-        # One-shot gestures: fire once after hold_frames, then re-arm only after
-        # the user changes gesture (cleared by the streak reset above).
-        if gesture == "open_palm" and self._gesture_streak >= cfg.hold_frames \
-                and ACTION_TAKEOFF not in self._armed_actions:
-            self._armed_actions.add(ACTION_TAKEOFF)
-            return Command(action=ACTION_TAKEOFF)
-        if gesture == "fist" and self._gesture_streak >= cfg.hold_frames \
-                and ACTION_LAND not in self._armed_actions:
-            self._armed_actions.add(ACTION_LAND)
-            return Command(action=ACTION_LAND)
-        if gesture == "thumbs_up" and self._gesture_streak >= cfg.hold_frames \
-                and ACTION_ESTOP not in self._armed_actions:
-            self._armed_actions.add(ACTION_ESTOP)
-            return Command(action=ACTION_ESTOP)
+        # Treat low-confidence predictions as "no gesture" (still in flight mode if eligible).
+        effective = gesture if score >= cfg.min_gesture_score else ""
 
-        # Continuous flight: index finger up only.
-        if gesture == "index_only" and self._gesture_streak >= cfg.fly_hold_frames:
-            return self._fly_command(landmarks)
+        # Track streak for debouncing.
+        if effective == self._last_gesture:
+            self._streak += 1
+        else:
+            self._last_gesture = effective
+            self._streak = 1
+            self._fired.clear()
+
+        # One-shot actions: open palm / fist / thumb-down → fire once after hold.
+        if effective in _ONE_SHOT_ACTIONS:
+            hold = cfg.estop_hold_frames if effective == "Thumb_Down" else cfg.hold_frames
+            action = _ONE_SHOT_ACTIONS[effective]
+            if self._streak >= hold and action not in self._fired:
+                self._fired.add(action)
+                return Command(action=action)
+            return Command(action=ACTION_NONE)
+
+        # Continuous control: hand visible (any non-action gesture) → fly.
+        if self._streak >= cfg.fly_hold_frames:
+            return self._fly_command(landmarks, timestamp)
 
         return Command(action=ACTION_NONE)
 
-    def _fly_command(self, lm: np.ndarray) -> Command:
+    # --- continuous control ----------------------------------------------------
+
+    def _fly_command(self, lm: np.ndarray, t: Optional[float]) -> Command:
         cfg = self.config
-        wrist = lm[0]
-        # Wrist offset from center, in [-1, 1] roughly (normalized landmark space).
-        dx = (wrist[0] - 0.5) * 2.0
-        dy = (wrist[1] - 0.5) * 2.0
 
-        def axis(value: float) -> float:
-            if abs(value) < cfg.deadzone:
-                return 0.0
-            # Scale linearly from deadzone..1 → 0..max_speed
-            sign = 1.0 if value > 0 else -1.0
-            mag = (abs(value) - cfg.deadzone) / (1.0 - cfg.deadzone)
-            return sign * _clamp(mag, 0.0, 1.0) * cfg.max_speed
+        # Palm center = mean of wrist (0) and MCPs of index/middle/ring/pinky (5,9,13,17).
+        palm = lm[[0, 5, 9, 13, 17]].mean(axis=0)
+        # Offsets from frame center, in roughly [-1, 1].
+        dx = (palm[0] - 0.5) * 2.0
+        dy = (palm[1] - 0.5) * 2.0
 
-        roll = axis(dx)
-        # Frame y grows downward → invert so "hand up" raises drone.
-        throttle = -axis(dy)
+        # Hand roll = angle of the line from pinky-MCP (17) to index-MCP (5).
+        # When palm is held flat-vertical the line is roughly horizontal; tilting
+        # the hand left or right rotates it. This drives yaw.
+        v = lm[5] - lm[17]
+        roll_angle = math.atan2(v[1], v[0])  # radians; 0 ≈ flat (index right of pinky)
+        # Normalize so flat hand ~ 0.
+        norm_yaw = _clamp(roll_angle / (math.pi / 2), -1.0, 1.0) * cfg.yaw_gain
+        norm_yaw = _clamp(norm_yaw, -1.0, 1.0)
 
-        # Pitch: angle of index finger (wrist→tip) relative to vertical.
-        tip = lm[8]
-        vx, vy = tip[0] - wrist[0], tip[1] - wrist[1]
-        # If finger points straight up, vy is strongly negative → pitch ~ 0.
-        # Tilting tip forward (toward camera top, smaller y) doesn't help — instead
-        # we use the wrist depth coordinate (z) for forward/back; negative z is
-        # closer to the camera in MediaPipe space.
-        pitch_signal = -lm[0, 2]  # closer hand → positive pitch (forward)
-        pitch = axis(_clamp(pitch_signal * 4.0, -1.0, 1.0))
+        # Forward/back pitch from wrist Z (negative z = closer to camera in MediaPipe).
+        # Push palm toward camera → forward; pull away → backward.
+        pitch_signal = _clamp(-lm[0, 2] * 5.0, -1.0, 1.0)
+
+        roll_norm = self._shape(dx)
+        throttle_norm = self._shape(-dy)  # invert: hand up (small y) → throttle up
+        pitch_norm = self._shape(pitch_signal, deadzone=cfg.deadzone * 0.8)
+
+        roll_out = self._roll_f(roll_norm * cfg.max_speed, t)
+        throttle_out = self._throttle_f(throttle_norm * cfg.max_speed, t)
+        pitch_out = self._pitch_f(pitch_norm * cfg.max_speed, t)
+        yaw_out = self._yaw_f(self._shape(norm_yaw, deadzone=cfg.deadzone) * cfg.max_speed, t)
 
         return Command(
             action=ACTION_FLY,
-            roll=roll,
-            throttle=throttle,
-            pitch=pitch,
-            yaw=0.0,
+            pitch=pitch_out,
+            roll=roll_out,
+            throttle=throttle_out,
+            yaw=yaw_out,
         )
+
+    def _shape(self, v: float, deadzone: Optional[float] = None) -> float:
+        cfg = self.config
+        dz = cfg.deadzone if deadzone is None else deadzone
+        if abs(v) < dz:
+            return 0.0
+        sign = 1.0 if v > 0 else -1.0
+        # Rescale (dz, 1) → (0, 1) then apply expo.
+        rescaled = (abs(v) - dz) / (1.0 - dz)
+        return sign * _expo(_clamp(rescaled, 0.0, 1.0), cfg.expo)

@@ -77,21 +77,37 @@ python -m src.main
 
 ## Gestures
 
-| Gesture (right hand)              | Action                         |
-|-----------------------------------|--------------------------------|
-| Open palm (5 fingers up)          | Takeoff                        |
-| Closed fist                       | Land                           |
-| Thumbs-up only                    | Emergency stop                 |
-| Index finger up (others closed)   | Continuous flight mode         |
+Hand detection and gesture classification use Google's pretrained
+**MediaPipe GestureRecognizer** model (auto-downloaded on first run to
+`models/gesture_recognizer.task`). Recognized labels drive these actions:
 
-In continuous flight mode, wrist position in the frame drives motion:
+| Gesture           | Action                              |
+|-------------------|-------------------------------------|
+| Open Palm         | Takeoff (hold ~0.3 s)               |
+| Closed Fist       | Land                                |
+| Thumb Down        | Emergency stop (longer hold)        |
+| Pointing Up       | Continuous flight mode              |
+| (any other hand)  | Hover / no input                    |
 
-- X offset from center → roll
-- Y offset from center → throttle
-- Index-finger pitch vs. wrist → pitch
+In continuous flight mode:
+- Palm X offset from frame center → **roll**
+- Palm Y offset from frame center → **throttle**
+- Wrist depth (palm closer/farther from camera) → **pitch**
+- Hand roll angle (line from pinky to index MCP) → **yaw**
 
-A central deadzone keeps the drone hovering when your hand is near the middle
-of the frame. Press **q** at any time to land and quit.
+Outputs are deadzoned, expo-shaped, and One-Euro-filtered so the drone holds
+position cleanly when your hand is near the center. Press **q** at any time to
+land and quit.
+
+### Production-grade behaviors
+
+- Pretrained gesture model (not hand-rolled finger heuristics).
+- One-Euro adaptive filter on stick outputs — smooth at rest, responsive in motion.
+- One-shot gesture debouncing prevents accidental takeoff/land.
+- Hand-lost watchdog: auto-land after ~1.2 s without a hand in frame.
+- Hard speed cap on every output, applied below the mapper.
+- Pair retries on connect; battery polling shown in HUD.
+- DirectShow capture backend on Windows + low capture buffer for low latency.
 
 ## Tests
 
