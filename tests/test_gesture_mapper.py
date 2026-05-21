@@ -26,10 +26,20 @@ def _hand_at(wx: float = 0.5, wy: float = 0.5, wz: float = 0.0) -> np.ndarray:
     lm = np.zeros((21, 3), dtype=np.float32)
     lm[0] = (wx, wy, wz)
     # Place finger MCPs around the wrist; the mapper averages them for palm center.
-    lm[5] = (wx + 0.05, wy - 0.10, 0.0)   # index MCP (upper right)
-    lm[9] = (wx + 0.00, wy - 0.10, 0.0)   # middle MCP
-    lm[13] = (wx - 0.03, wy - 0.10, 0.0)  # ring MCP
-    lm[17] = (wx - 0.06, wy - 0.10, 0.0)  # pinky MCP
+    # MCPs sit roughly one palm-length above the wrist so the wrist→middle-MCP
+    # distance matches MapperConfig.pitch_baseline (= 0.18), keeping the
+    # forward/back signal at zero in tests unless we explicitly change palm size.
+    lm[5] = (wx + 0.05, wy - 0.18, 0.0)   # index MCP
+    lm[9] = (wx + 0.00, wy - 0.18, 0.0)   # middle MCP
+    lm[13] = (wx - 0.03, wy - 0.18, 0.0)  # ring MCP
+    lm[17] = (wx - 0.06, wy - 0.18, 0.0)  # pinky MCP
+    return lm
+
+
+def _hand_scaled(wx: float, wy: float, palm_len: float) -> np.ndarray:
+    """Hand whose wrist→middle-MCP length matches `palm_len`."""
+    lm = _hand_at(wx, wy)
+    lm[9] = (wx, wy - palm_len, 0.0)
     return lm
 
 
@@ -80,10 +90,11 @@ def test_estop_requires_longer_hold():
 def test_fly_mode_outputs_command_with_centered_hand():
     cfg = MapperConfig(deadzone=0.15, fly_hold_frames=1, max_speed=50)
     m = GestureMapper(config=cfg)
-    # Pointing_Up triggers continuous control. Centered hand → near-zero sticks.
-    cmd = m.update(_hand_at(0.5, 0.5), "Pointing_Up", 0.9)
+    # Pointing_Up triggers continuous control. Place wrist so that the palm
+    # center (mean of wrist + 4 MCPs, each 0.18 above the wrist) lands at
+    # frame-center (0.5, 0.5): wrist_y = 0.5 + 4*0.18/5 = 0.644.
+    cmd = m.update(_hand_at(0.5, 0.644), "Pointing_Up", 0.9)
     assert cmd.action == ACTION_FLY
-    # "Hover-quality" — within ~2% of max_speed=50 in any axis is good enough.
     assert abs(cmd.roll) < 1.0
     assert abs(cmd.throttle) < 1.0
     assert abs(cmd.pitch) < 1.0
@@ -103,6 +114,26 @@ def test_fly_mode_throttle_up_when_hand_high():
     cmd = m.update(_hand_at(0.5, 0.05), "Pointing_Up", 0.9)
     assert cmd.action == ACTION_FLY
     assert cmd.throttle > 0.0
+
+
+def test_fly_mode_pitch_forward_when_hand_close():
+    cfg = MapperConfig(deadzone=0.05, fly_hold_frames=1, max_speed=50, expo=0.0,
+                       pitch_baseline=0.18, pitch_deadband=0.1, pitch_gain=4.0)
+    m = GestureMapper(config=cfg)
+    # palm_len = 0.30 (well above baseline 0.18) → hand close to camera → forward
+    cmd = m.update(_hand_scaled(0.5, 0.5, palm_len=0.30), "Pointing_Up", 0.9)
+    assert cmd.action == ACTION_FLY
+    assert cmd.pitch > 5.0
+
+
+def test_fly_mode_pitch_back_when_hand_far():
+    cfg = MapperConfig(deadzone=0.05, fly_hold_frames=1, max_speed=50, expo=0.0,
+                       pitch_baseline=0.18, pitch_deadband=0.1, pitch_gain=4.0)
+    m = GestureMapper(config=cfg)
+    # palm_len = 0.08 (well below baseline) → hand far from camera → backward
+    cmd = m.update(_hand_scaled(0.5, 0.5, palm_len=0.08), "Pointing_Up", 0.9)
+    assert cmd.action == ACTION_FLY
+    assert cmd.pitch < -5.0
 
 
 def test_one_euro_filter_converges_on_constant_signal():

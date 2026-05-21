@@ -45,6 +45,13 @@ class MapperConfig:
     estop_hold_frames: int = 18     # E-stop deliberately requires a longer hold
     min_gesture_score: float = 0.55 # ignore low-confidence gesture predictions
     yaw_gain: float = 1.4           # how aggressively hand roll maps to yaw
+    # Forward/back pitch: derived from apparent hand size. The baseline is the
+    # palm length (wrist → middle-finger MCP) in normalized image coords at the
+    # user's "neutral" distance from the camera. Bigger than baseline ⇒ closer
+    # to camera ⇒ forward. Smaller ⇒ farther ⇒ backward.
+    pitch_baseline: float = 0.18
+    pitch_gain: float = 6.0
+    pitch_deadband: float = 0.15    # ignore deviations smaller than this (fraction)
 
 
 # Gesture name → high-level action. "Pointing_Up" stays as continuous control,
@@ -153,13 +160,24 @@ class GestureMapper:
         norm_yaw = _clamp(roll_angle / (math.pi / 2), -1.0, 1.0) * cfg.yaw_gain
         norm_yaw = _clamp(norm_yaw, -1.0, 1.0)
 
-        # Forward/back pitch from wrist Z (negative z = closer to camera in MediaPipe).
-        # Push palm toward camera → forward; pull away → backward.
-        pitch_signal = _clamp(-lm[0, 2] * 5.0, -1.0, 1.0)
+        # Forward/back pitch from apparent palm size in the image.
+        # Wrist-z in MediaPipe is unreliable on its own; the projected palm
+        # length is much more stable. Bigger than baseline → closer → forward.
+        palm_len = float(np.linalg.norm(lm[9, :2] - lm[0, :2]))
+        pitch_raw = (palm_len - cfg.pitch_baseline) / cfg.pitch_baseline
+        if abs(pitch_raw) < cfg.pitch_deadband:
+            pitch_signal = 0.0
+        else:
+            sign = 1.0 if pitch_raw > 0 else -1.0
+            pitch_signal = _clamp(
+                sign * (abs(pitch_raw) - cfg.pitch_deadband) * cfg.pitch_gain,
+                -1.0, 1.0,
+            )
 
         roll_norm = self._shape(dx)
         throttle_norm = self._shape(-dy)  # invert: hand up (small y) → throttle up
-        pitch_norm = self._shape(pitch_signal, deadzone=cfg.deadzone * 0.8)
+        # pitch_signal is already deadbanded above, so use zero deadzone here.
+        pitch_norm = self._shape(pitch_signal, deadzone=0.0)
 
         roll_out = self._roll_f(roll_norm * cfg.max_speed, t)
         throttle_out = self._throttle_f(throttle_norm * cfg.max_speed, t)

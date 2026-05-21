@@ -72,7 +72,12 @@ def draw_hud(frame, *, fps: float, gesture: str, score: float,
 
     line2 = f"action: {cmd.action}"
     if cmd.action == ACTION_FLY:
-        line2 += f"   P {cmd.pitch:+5.0f}   R {cmd.roll:+5.0f}   T {cmd.throttle:+5.0f}   Y {cmd.yaw:+5.0f}"
+        line2 += (
+            f"   Fwd/Back {cmd.pitch:+5.0f}"
+            f"   Left/Right {cmd.roll:+5.0f}"
+            f"   Up/Down {cmd.throttle:+5.0f}"
+            f"   Turn {cmd.yaw:+5.0f}"
+        )
     cv2.putText(frame, line2, (10, 54), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 1, cv2.LINE_AA)
 
     # Bottom hint

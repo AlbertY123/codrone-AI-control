@@ -79,27 +79,36 @@ python -m src.main
 
 Hand detection and gesture classification use Google's pretrained
 **MediaPipe GestureRecognizer** model (auto-downloaded on first run to
-`models/gesture_recognizer.task`). Recognized labels drive these actions:
+`models/gesture_recognizer.task`). Recognized hand shapes do these things:
 
-| Gesture           | Action                              |
-|-------------------|-------------------------------------|
-| Open Palm         | Takeoff (hold ~0.3 s)               |
-| Closed Fist       | Land                                |
-| Thumb Down        | Emergency stop (longer hold)        |
-| Pointing Up       | Continuous flight mode              |
-| (any other hand)  | Hover / no input                    |
+| Hand shape           | What the drone does                   |
+|----------------------|---------------------------------------|
+| Open palm            | Takes off (hold for ~0.3 s)           |
+| Closed fist          | Lands                                 |
+| Thumb down           | Emergency stop (hold longer)          |
+| Index finger up      | Enters fly mode — see below           |
+| (anything else)      | Hovers in place                       |
 
-In continuous flight mode:
-- Palm X offset from frame center → **roll**
-- Palm Y offset from frame center → **throttle**
-- Wrist depth (palm closer/farther from camera) → **pitch**
-- Hand roll angle (line from pinky to index MCP) → **yaw**
+### Fly mode — how your hand moves the drone
 
-Outputs are deadzoned, expo-shaped, and One-Euro-filtered so the drone holds
-position cleanly when your hand is near the center. Press **q** at any time to
-land and quit.
+Once you raise your index finger and the drone enters fly mode, move your hand
+around in front of the camera:
 
-### Production-grade behaviors
+| Hand motion                                  | Drone reaction          |
+|----------------------------------------------|-------------------------|
+| Move hand **left / right**                   | Drone slides left/right |
+| Move hand **up / down**                      | Drone rises / lowers    |
+| Move hand **closer to / farther from camera**| Drone flies forward / back |
+| **Tilt hand** clockwise / counter-clockwise  | Drone turns right / left|
+
+When your hand is near the middle of the frame at a normal distance, all four
+controls sit at zero and the drone hovers. There's a small dead-zone around
+the center so tiny hand wobbles don't move the drone, and outputs are smoothed
+by a One-Euro filter so motion stays clean.
+
+Press **q** at any time to land and quit.
+
+### Under the hood
 
 - Pretrained gesture model (not hand-rolled finger heuristics).
 - One-Euro adaptive filter on stick outputs — smooth at rest, responsive in motion.
